@@ -1,29 +1,36 @@
-use crate::layout::{self, Groups, LayeredOptions};
+use crate::compound::{
+    CEdge, CNode, Dir, cnode, compound_layout, inherit_crossed_directions, shift_layout,
+};
+use crate::fit_width::{runs_across, tighten, title_room, turn_to_fit};
+use crate::flow_shapes::{end_side, inset_route};
+use crate::layout::LayeredOptions;
+use crate::svg::cluster::{
+    Crossings, cluster_title_x, mark_crossings, struck_title, title_crossed,
+};
+use crate::svg::edges::{
+    EdgePath, Fill, casings_svg, edge_casing, edge_label_svg, loop_path, marker, marker_trim,
+    over_fills, route_path, side_reach,
+};
+use crate::svg::ink::{ink_fill, paints};
+use crate::svg::theme::{ResolvedStyle, class_names, resolve_style, rounded, sets_fill};
+use crate::svg::title::title_label;
 use crate::{PeleError, RenderOptions, RenderResult, svg, text};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Direction {
-    #[default]
-    Tb,
-    Bt,
-    Lr,
-    Rl,
-}
+const MAX_DEPTH: usize = 128;
+const NODE_SEP: f64 = 40.0;
+const EDGE_SEP: f64 = 16.0;
+const RANK_SEP: f64 = 48.0;
+const GROUP_PAD: f64 = 20.0;
+const LOOP: f64 = 26.0;
 
-impl Direction {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "TD" | "TB" => Some(Self::Tb),
-            "BT" => Some(Self::Bt),
-            "LR" => Some(Self::Lr),
-            "RL" => Some(Self::Rl),
-            _ => None,
-        }
-    }
-
-    fn sideways(self) -> bool {
-        matches!(self, Self::Lr | Self::Rl)
+fn parse_direction(value: &str) -> Option<Dir> {
+    match value.trim() {
+        "TD" | "TB" => Some(Dir::Tb),
+        "BT" => Some(Dir::Bt),
+        "LR" => Some(Dir::Lr),
+        "RL" => Some(Dir::Rl),
+        _ => None,
     }
 }
 
@@ -110,11 +117,44 @@ impl Shape {
             Self::Asymmetric => (width + 36.0 + base_h / 4.0, base_h, 0.0),
             Self::Text => (width + 8.0, height + 8.0, 0.0),
             Self::Start => (14.0, 14.0, 0.0),
-            Self::End => (20.0, 20.0, 0.0),
-            Self::Fork => (70.0, 8.0, 0.0),
+            Self::End => (18.0, 18.0, 0.0),
+            Self::Fork => (72.0, 8.0, 0.0),
             Self::Extended(name) => {
                 crate::flow_shapes::size(name, width, height).expect("canonical extended shape")
             }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rect => "rect",
+            Self::Rounded => "rounded",
+            Self::Stadium => "stadium",
+            Self::Subroutine => "fr-rect",
+            Self::Cylinder => "cyl",
+            Self::Circle => "circle",
+            Self::DoubleCircle => "dbl-circ",
+            Self::Ellipse => "ellipse",
+            Self::Diamond => "diam",
+            Self::Hexagon => "hex",
+            Self::LeanRight => "lean-r",
+            Self::LeanLeft => "lean-l",
+            Self::TrapBottom => "trap-b",
+            Self::TrapTop => "trap-t",
+            Self::Asymmetric => "odd",
+            Self::Text => "text",
+            Self::Start => "sm-circ",
+            Self::End => "fr-circ",
+            Self::Fork => "fork",
+            Self::Extended(name) => name,
+        }
+    }
+
+    fn filled(self) -> bool {
+        match self {
+            Self::Text => false,
+            Self::Extended(name) => crate::flow_shapes::filled(name),
+            _ => true,
         }
     }
 
@@ -171,7 +211,7 @@ impl Shape {
                     w - 24.0
                 }
             }
-            Self::Fork => 0.0,
+            Self::Fork => side - 8.0,
             Self::Extended(name) => crate::flow_shapes::span(name, w, h, sideways),
         }
         .max(0.0)
@@ -248,6 +288,17 @@ enum Marker {
     Cross,
 }
 
+impl Marker {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Point => "arrow_point",
+            Self::Circle => "arrow_circle",
+            Self::Cross => "arrow_cross",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Stroke {
     #[default]
@@ -264,7 +315,6 @@ struct Node {
     shape: Shape,
     styles: Vec<String>,
     classes: Vec<String>,
-    parent: Option<usize>,
     link: Option<String>,
     target: Option<String>,
     tooltip: Option<String>,
@@ -282,26 +332,36 @@ struct Edge {
     minlen: usize,
     styles: Vec<String>,
     classes: Vec<String>,
+    curve: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct Group {
     id: String,
     title: String,
-    parent: Option<usize>,
-    direction: Option<Direction>,
-    styles: Vec<String>,
+    members: Vec<String>,
+    direction: Option<Dir>,
     classes: Vec<String>,
+    collapsed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Frame {
+    id: Option<String>,
+    title: String,
+    list: Vec<String>,
+    direction: Option<Dir>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Model {
-    direction: Direction,
+    direction: Dir,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     groups: Vec<Group>,
     classes: HashMap<String, Vec<String>>,
     default_edge_style: Vec<String>,
+    default_curve: Option<String>,
     acc_title: Option<String>,
     acc_descr: Option<String>,
 }
@@ -655,7 +715,7 @@ impl<'a> Cursor<'a> {
         &mut self,
         model: &mut Model,
         indices: &mut HashMap<String, usize>,
-        parent: Option<usize>,
+        groups: &HashMap<String, usize>,
     ) -> Result<usize, PeleError> {
         let id = self.id()?;
         let mut label = None;
@@ -713,6 +773,12 @@ impl<'a> Cursor<'a> {
                     return Err(self.error("Expected shape metadata key:value"));
                 };
                 let value = unquote(value.trim().trim_matches('\''));
+                if let Some(&group) = groups.get(&id) {
+                    if name.trim() == "view" {
+                        model.groups[group].collapsed = value == "collapsed";
+                    }
+                    continue;
+                }
                 match name.trim() {
                     "shape" => {
                         shape = Some(Shape::named(&value).ok_or_else(|| {
@@ -741,7 +807,6 @@ impl<'a> Cursor<'a> {
                 shape: Shape::Rect,
                 styles: Vec::new(),
                 classes: Vec::new(),
-                parent,
                 link: None,
                 target: None,
                 tooltip: None,
@@ -756,9 +821,6 @@ impl<'a> Cursor<'a> {
         if let Some(shape) = shape {
             node.shape = shape;
         }
-        if node.parent.is_none() {
-            node.parent = parent;
-        }
         if self.rest().starts_with(":::") {
             self.pos += 3;
             let class = self.id()?;
@@ -771,16 +833,16 @@ impl<'a> Cursor<'a> {
         &mut self,
         model: &mut Model,
         indices: &mut HashMap<String, usize>,
-        parent: Option<usize>,
+        groups: &HashMap<String, usize>,
     ) -> Result<Vec<usize>, PeleError> {
-        let mut nodes = vec![self.vertex(model, indices, parent)?];
+        let mut nodes = vec![self.vertex(model, indices, groups)?];
         loop {
             self.space();
             if !self.rest().starts_with('&') {
                 break;
             }
             self.pos += 1;
-            nodes.push(self.vertex(model, indices, parent)?);
+            nodes.push(self.vertex(model, indices, groups)?);
         }
         Ok(nodes)
     }
@@ -922,9 +984,9 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
             PeleError::syntax("Expected flowchart or graph", header.line, header.column)
         })?;
     let direction = if header_text.is_empty() {
-        Direction::Tb
+        Dir::Tb
     } else {
-        Direction::parse(header_text).ok_or_else(|| {
+        parse_direction(header_text).ok_or_else(|| {
             PeleError::syntax("Expected TB, TD, BT, LR or RL", header.line, header.column)
         })?
     };
@@ -933,14 +995,21 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
         ..Model::default()
     };
     let mut indices = HashMap::<String, usize>::new();
-    let mut groups: Vec<usize> = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
     let mut group_indices = HashMap::<String, usize>::new();
+    let mut members = HashSet::<String>::new();
+    let mut sub_count = 0usize;
     let mut pair_count = HashMap::<(usize, usize), usize>::new();
     for statement in statements.iter().skip(1) {
         let line = statement.text.as_str();
         if let Some(rest) = keyword(line, "subgraph") {
+            if frames.len() >= MAX_DEPTH {
+                return Err(PeleError::limit(
+                    "Flowchart subgraphs are nested too deeply",
+                ));
+            }
             let (id, title) = if rest.is_empty() {
-                (format!("subGraph{}", model.groups.len()), String::new())
+                (None, String::new())
             } else if let Some(open) = rest.find('[') {
                 if !rest.ends_with(']') {
                     return Err(PeleError::syntax(
@@ -950,64 +1019,67 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                     ));
                 }
                 let id = rest[..open].trim();
-                let id = if id.is_empty() {
-                    format!("subGraph{}", model.groups.len())
-                } else {
-                    id.to_owned()
-                };
-                (id, unquote(&rest[open + 1..rest.len() - 1]))
+                (
+                    (!id.is_empty()).then(|| id.to_owned()),
+                    unquote(&rest[open + 1..rest.len() - 1]),
+                )
             } else {
                 let title = unquote(rest);
-                let id = if rest.chars().any(char::is_whitespace) || rest.starts_with('"') {
-                    format!("subGraph{}", model.groups.len())
-                } else {
-                    rest.to_owned()
-                };
+                let (_, plain) = markdown_label(&title);
+                let id = (!plain.is_empty() && !plain.chars().any(char::is_whitespace))
+                    .then(|| plain.to_owned());
                 (id, title)
             };
-            let index = if let Some(&index) = group_indices.get(&id) {
-                if groups.contains(&index) {
-                    return Err(PeleError::syntax(
-                        "A subgraph cannot contain itself",
-                        statement.line,
-                        statement.column,
-                    ));
-                }
-                index
-            } else {
-                let index = model.groups.len();
-                model.groups.push(Group {
-                    id: id.clone(),
-                    title,
-                    parent: groups.last().copied(),
-                    direction: None,
-                    styles: Vec::new(),
-                    classes: Vec::new(),
-                });
-                group_indices.insert(id, index);
-                index
-            };
-            groups.push(index);
+            frames.push(Frame {
+                id,
+                title,
+                list: Vec::new(),
+                direction: None,
+            });
             continue;
         }
         if line == "end" {
-            if groups.pop().is_none() {
+            let Some(frame) = frames.pop() else {
                 return Err(PeleError::syntax(
                     "Unexpected subgraph end",
                     statement.line,
                     statement.column,
                 ));
+            };
+            let id = frame.id.unwrap_or_else(|| format!("subGraph{sub_count}"));
+            sub_count += 1;
+            let mut seen = HashSet::new();
+            let fresh: Vec<String> = frame
+                .list
+                .into_iter()
+                .filter(|member| seen.insert(member.clone()))
+                .filter(|member| !members.contains(member) && *member != id)
+                .collect();
+            members.extend(fresh.iter().cloned());
+            if let Some(&index) = group_indices.get(&id) {
+                model.groups[index].members.extend(fresh);
+            } else {
+                group_indices.insert(id.clone(), model.groups.len());
+                model.groups.push(Group {
+                    id: id.clone(),
+                    title: frame.title.trim().to_owned(),
+                    members: fresh,
+                    direction: frame.direction,
+                    classes: Vec::new(),
+                    collapsed: false,
+                });
+            }
+            if let Some(parent) = frames.last_mut() {
+                parent.list.push(id);
             }
             continue;
         }
         if let Some(rest) = keyword(line, "direction") {
-            let direction = Direction::parse(rest).ok_or_else(|| {
+            let direction = parse_direction(rest).ok_or_else(|| {
                 PeleError::syntax("Invalid direction", statement.line, statement.column)
             })?;
-            if let Some(&parent) = groups.last() {
-                model.groups[parent].direction = Some(direction);
-            } else {
-                model.direction = direction;
+            if let Some(frame) = frames.last_mut() {
+                frame.direction = Some(direction);
             }
             continue;
         }
@@ -1046,12 +1118,14 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                 ));
             };
             for id in ids.split(',') {
-                let names = classes.trim().split(',').map(str::to_owned);
+                let names: Vec<String> = classes.trim().split(',').map(str::to_owned).collect();
                 if let Some(&index) = indices.get(id) {
-                    model.nodes[index].classes.extend(names);
-                } else if let Some(&index) = group_indices.get(id) {
-                    model.groups[index].classes.extend(names);
-                } else if let Some(edge) = model.edges.iter_mut().find(|edge| edge.id == id) {
+                    model.nodes[index].classes.extend(names.iter().cloned());
+                }
+                if let Some(&index) = group_indices.get(id) {
+                    model.groups[index].classes.extend(names.iter().cloned());
+                }
+                if let Some(edge) = model.edges.iter_mut().find(|edge| edge.id == id) {
                     edge.classes.extend(names);
                 }
             }
@@ -1066,29 +1140,24 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                 ));
             };
             let declarations = styles(declarations.trim())?;
-            if let Some(&index) = group_indices.get(id) {
-                model.groups[index].styles.extend(declarations);
+            let index = if let Some(&index) = indices.get(id) {
+                index
             } else {
-                let index = if let Some(&index) = indices.get(id) {
-                    index
-                } else {
-                    let index = model.nodes.len();
-                    model.nodes.push(Node {
-                        id: id.to_owned(),
-                        label: id.to_owned(),
-                        shape: Shape::Rect,
-                        styles: Vec::new(),
-                        classes: Vec::new(),
-                        parent: groups.last().copied(),
-                        link: None,
-                        target: None,
-                        tooltip: None,
-                    });
-                    indices.insert(id.to_owned(), index);
-                    index
-                };
-                model.nodes[index].styles.extend(declarations);
-            }
+                let index = model.nodes.len();
+                model.nodes.push(Node {
+                    id: id.to_owned(),
+                    label: id.to_owned(),
+                    shape: Shape::Rect,
+                    styles: Vec::new(),
+                    classes: Vec::new(),
+                    link: None,
+                    target: None,
+                    tooltip: None,
+                });
+                indices.insert(id.to_owned(), index);
+                index
+            };
+            model.nodes[index].styles.extend(declarations);
             continue;
         }
         if let Some(rest) = keyword(line, "linkStyle") {
@@ -1099,15 +1168,26 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                     statement.column,
                 ));
             };
-            if declarations.trim().starts_with("interpolate") {
-                return Err(PeleError::unsupported(
-                    "Flowchart edge interpolation directives are not yet ported",
-                ));
+            let mut declarations = declarations.trim();
+            let mut interpolate = None;
+            if let Some(rest) = keyword(declarations, "interpolate") {
+                let (name, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                interpolate = Some(name.to_owned());
+                declarations = tail.trim();
             }
-            let declarations = styles(declarations.trim())?;
+            let declarations = if declarations.is_empty() {
+                None
+            } else {
+                Some(styles(declarations)?)
+            };
             for id in ids.split(',') {
                 if id == "default" {
-                    model.default_edge_style.extend(declarations.clone());
+                    if interpolate.is_some() {
+                        model.default_curve.clone_from(&interpolate);
+                    }
+                    if let Some(declarations) = &declarations {
+                        model.default_edge_style.clone_from(declarations);
+                    }
                 } else {
                     let index = id.parse::<usize>().map_err(|_| {
                         PeleError::syntax(
@@ -1123,7 +1203,12 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                             statement.column,
                         ));
                     };
-                    edge.styles.extend(declarations.clone());
+                    if interpolate.is_some() {
+                        edge.curve.clone_from(&interpolate);
+                    }
+                    if let Some(declarations) = &declarations {
+                        edge.styles.clone_from(declarations);
+                    }
                 }
             }
             continue;
@@ -1179,7 +1264,7 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
         }
         if let Some(at) = line.find("@{") {
             let id = line[..at].trim();
-            if model.edges.iter().any(|edge| edge.id == id) {
+            if let Some(edge_index) = model.edges.iter().position(|edge| edge.id == id) {
                 let Some(data) = line[at + 2..].strip_suffix('}') else {
                     return Err(PeleError::syntax(
                         "Unterminated edge metadata",
@@ -1197,7 +1282,10 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                     };
                     match name.trim() {
                         "animate" | "animation" => {}
-                        "curve" if unquote(value) == "linear" => {}
+                        "curve" => {
+                            model.edges[edge_index].curve =
+                                Some(unquote(value.trim().trim_matches('\'')));
+                        }
                         name => {
                             return Err(PeleError::unsupported(format!(
                                 "Flowchart edge metadata {name} is not yet ported"
@@ -1214,14 +1302,16 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
             line: statement.line,
             column: statement.column,
         };
-        let mut tails = cursor.node_set(&mut model, &mut indices, groups.last().copied())?;
+        let mut tails = cursor.node_set(&mut model, &mut indices, &group_indices)?;
+        let mut mentioned: Vec<usize> = tails.clone();
         loop {
             cursor.space();
             if cursor.rest().is_empty() {
                 break;
             }
             let (label, stroke, start, end, minlen, id) = cursor.link()?;
-            let heads = cursor.node_set(&mut model, &mut indices, groups.last().copied())?;
+            let heads = cursor.node_set(&mut model, &mut indices, &group_indices)?;
+            mentioned.extend(&heads);
             let extra = tails
                 .len()
                 .checked_mul(heads.len())
@@ -1254,102 +1344,38 @@ fn parse(source: &str, max_edges: usize) -> Result<Model, PeleError> {
                         minlen,
                         styles: Vec::new(),
                         classes: Vec::new(),
+                        curve: None,
                     });
                 }
             }
             tails = heads;
         }
+        if let Some(frame) = frames.last_mut() {
+            frame
+                .list
+                .extend(mentioned.iter().map(|&index| model.nodes[index].id.clone()));
+        }
     }
-    if !groups.is_empty() {
+    if !frames.is_empty() {
         return Err(PeleError::syntax(
             "Expected subgraph end",
             source.lines().count().max(1),
             1,
         ));
     }
-    if model
-        .nodes
-        .iter()
-        .any(|node| group_indices.contains_key(&node.id))
-    {
-        return Err(PeleError::unsupported(
-            "Edges to subgraph identifiers are not yet ported",
-        ));
-    }
-    if model
-        .groups
-        .iter()
-        .any(|group| group.direction.is_some_and(|dir| dir != model.direction))
-    {
-        return Err(PeleError::unsupported(
-            "Independent subgraph directions require the compound layout port",
-        ));
-    }
     Ok(model)
 }
 
-fn compiled_styles(model: &Model, classes: &[String], own: &[String]) -> Vec<String> {
-    let mut result = Vec::new();
-    for name in classes {
-        if let Some(styles) = model.classes.get(name) {
-            result.extend(styles.clone());
-        }
-    }
-    result.extend_from_slice(own);
-    result
-}
-
-fn style_property<'a>(styles: &'a [String], name: &str) -> Option<&'a str> {
-    styles.iter().rev().find_map(|item| {
-        item.split_once(':')
-            .filter(|(property, _)| *property == name)
-            .map(|(_, value)| value)
-    })
-}
-
-fn style_attrs(styles: &[String], text: bool) -> String {
-    let declarations: Vec<_> = styles
-        .iter()
-        .filter_map(|item| {
-            let (property, value) = item.split_once(':')?;
-            if text {
-                match property {
-                    "color" => Some(format!("fill:{value}")),
-                    "font-size" | "font-family" | "font-weight" | "font-style"
-                    | "text-decoration" | "letter-spacing" | "word-spacing" | "opacity" => {
-                        Some(item.clone())
-                    }
-                    _ => None,
-                }
-            } else if matches!(
-                property,
-                "fill"
-                    | "fill-opacity"
-                    | "stroke"
-                    | "stroke-width"
-                    | "stroke-dasharray"
-                    | "stroke-dashoffset"
-                    | "stroke-linecap"
-                    | "stroke-linejoin"
-                    | "stroke-opacity"
-                    | "opacity"
-                    | "rx"
-                    | "ry"
-            ) {
-                Some(item.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if declarations.is_empty() {
-        String::new()
-    } else {
-        format!(" style=\"{}\"", svg::esc(&declarations.join(";")))
-    }
-}
-
-fn shape_svg(shape: Shape, w: f64, h: f64, attrs: &str, line_attrs: &str, radius: f64) -> String {
+fn shape_svg(
+    shape: Shape,
+    w: f64,
+    h: f64,
+    attrs: &str,
+    line_attrs: &str,
+    radius: f64,
+    line_color: &str,
+) -> String {
+    let line_fill = svg::esc(line_color);
     let n = svg::num;
     let rect = |rx: f64| {
         format!(
@@ -1359,6 +1385,16 @@ fn shape_svg(shape: Shape, w: f64, h: f64, attrs: &str, line_attrs: &str, radius
             n(w),
             n(h),
             n(rx)
+        )
+    };
+    let square = || {
+        format!(
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{}/>",
+            n(-w / 2.0),
+            n(-h / 2.0),
+            n(w),
+            n(h),
+            rounded(attrs, radius)
         )
     };
     let polygon = |points: &[(f64, f64)]| {
@@ -1372,14 +1408,14 @@ fn shape_svg(shape: Shape, w: f64, h: f64, attrs: &str, line_attrs: &str, radius
         )
     };
     match shape {
-        Shape::Rect => rect(radius),
+        Shape::Rect => square(),
         Shape::Rounded => rect(12.0_f64.min(h / 2.0)),
         Shape::Stadium => rect(h / 2.0),
         Shape::Subroutine => {
             let x = w / 2.0 - 8.0;
             format!(
                 "{}<path d=\"M{},{}V{}M{},{}V{}\" fill=\"none\"{line_attrs}/>",
-                rect(radius),
+                square(),
                 n(-x),
                 n(-h / 2.0),
                 n(h / 2.0),
@@ -1473,571 +1509,745 @@ fn shape_svg(shape: Shape, w: f64, h: f64, attrs: &str, line_attrs: &str, radius
                 n(top)
             )
         }
-        Shape::Text => String::new(),
-        Shape::Start => format!("<circle r=\"{}\"{line_attrs}/>", n(w / 2.0)),
+        Shape::Text => format!(
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"none\"/>",
+            n(-w / 2.0),
+            n(-h / 2.0),
+            n(w),
+            n(h)
+        ),
+        Shape::Start => format!("<circle r=\"{}\"{attrs}/>", n(w / 2.0)),
         Shape::End => format!(
-            "<circle r=\"{}\"{attrs}/><circle r=\"{}\"{line_attrs}/>",
+            "<circle r=\"{}\"{attrs}/><circle r=\"{}\" fill=\"{line_fill}\"{line_attrs}/>",
             n(w / 2.0),
             n(w / 2.0 - 4.0)
         ),
-        Shape::Fork => rect(2.0),
-        Shape::Extended(name) => crate::flow_shapes::draw(name, w, h, attrs, line_attrs, radius)
-            .expect("canonical extended shape"),
+        Shape::Fork => format!(
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"2\" fill=\"{line_fill}\"{line_attrs}/>",
+            n(-w / 2.0),
+            n(-h / 2.0),
+            n(w),
+            n(h)
+        ),
+        Shape::Extended(name) => crate::flow_shapes::draw_with_line_color(
+            name, w, h, attrs, line_attrs, radius, line_color,
+        )
+        .expect("canonical extended shape"),
     }
 }
 
-fn marker_svg(marker: Marker, x: f64, y: f64, dx: f64, dy: f64, color: &str) -> String {
-    let magnitude = dx.hypot(dy);
-    if marker == Marker::None || magnitude < 0.0001 {
-        return String::new();
+fn compiled(model: &Model, names: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in names {
+        let Some(styles) = model.classes.get(*name) else {
+            continue;
+        };
+        out.extend(styles.iter().map(|style| style.trim().to_owned()));
+        out.extend(
+            styles
+                .iter()
+                .filter(|style| style.contains("color"))
+                .map(|style| style.replacen("fill", "bgFill", 1).trim().to_owned()),
+        );
     }
-    let ux = dx / magnitude;
-    let uy = dy / magnitude;
-    let n = svg::num;
-    match marker {
-        Marker::Point => format!(
-            "<path d=\"M{},{}L{},{}L{},{}Z\" fill=\"{}\"/>",
-            n(x),
-            n(y),
-            n(x - ux * 9.0 + uy * 4.0),
-            n(y - uy * 9.0 - ux * 4.0),
-            n(x - ux * 9.0 - uy * 4.0),
-            n(y - uy * 9.0 + ux * 4.0),
-            svg::esc(color)
-        ),
-        Marker::Circle => format!(
-            "<circle cx=\"{}\" cy=\"{}\" r=\"4\" fill=\"{}\"/>",
-            n(x - ux * 4.0),
-            n(y - uy * 4.0),
-            svg::esc(color)
-        ),
-        Marker::Cross => format!(
-            "<path d=\"M{},{}L{},{}M{},{}L{},{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2\"/>",
-            n(x - ux * 3.0 + uy * 4.0),
-            n(y - uy * 3.0 - ux * 4.0),
-            n(x - ux * 3.0 - uy * 4.0),
-            n(y - uy * 3.0 + ux * 4.0),
-            n(x - ux * 7.0 + uy * 4.0),
-            n(y - uy * 7.0 - ux * 4.0),
-            n(x + ux + uy * -4.0),
-            n(y + uy + ux * 4.0),
-            svg::esc(color)
-        ),
-        Marker::None => String::new(),
+    out
+}
+
+fn markdown_label(raw: &str) -> (bool, &str) {
+    if raw.len() >= 2 && raw.starts_with('`') && raw.ends_with('`') {
+        (true, &raw[1..raw.len() - 1])
+    } else {
+        (false, raw)
     }
+}
+
+struct GraphNode<'a> {
+    id: &'a str,
+    label: &'a str,
+    shape: Shape,
+    is_group: bool,
+    parent: Option<&'a str>,
+    styles: &'a [String],
+    compiled: Vec<String>,
+    classes: String,
+    dir: Option<Dir>,
+    vertex: Option<&'a Node>,
+}
+
+struct GraphEdge<'a> {
+    edge: &'a Edge,
+    start: &'a str,
+    end: &'a str,
+    style: Option<ResolvedStyle>,
+    curve: Option<&'a str>,
+}
+
+struct Graph<'a> {
+    nodes: Vec<GraphNode<'a>>,
+    edges: Vec<GraphEdge<'a>>,
+}
+
+fn build_graph<'a>(model: &'a Model, default_curve: Option<&'a str>) -> Graph<'a> {
+    let groups = &model.groups;
+    let group_of: HashMap<&str, usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| (group.id.as_str(), i))
+        .collect();
+    let mut group_parent = HashMap::<&str, &str>::new();
+    for group in groups {
+        for child in &group.members {
+            if group_of.contains_key(child.as_str()) {
+                group_parent.insert(child, &group.id);
+            }
+        }
+    }
+    let collapsed = |id: &str| group_of.get(id).is_some_and(|&g| groups[g].collapsed);
+    let mut hidden = HashSet::<&str>::new();
+    let mut collapsed_into = HashMap::<&str, &str>::new();
+    if groups.iter().any(|group| group.collapsed) {
+        let mut outermost = HashMap::<&str, Option<&str>>::new();
+        for group in groups {
+            let mut chain = Vec::new();
+            let mut seen = HashSet::new();
+            let mut current = Some(group.id.as_str());
+            while let Some(id) = current {
+                if outermost.contains_key(id) || !seen.insert(id) {
+                    break;
+                }
+                chain.push(id);
+                current = group_parent.get(id).copied();
+            }
+            let mut result = current.and_then(|id| outermost.get(id).copied().flatten());
+            for &id in chain.iter().rev() {
+                if result.is_none() && collapsed(id) {
+                    result = Some(id);
+                }
+                outermost.insert(id, result);
+            }
+            let Some(ancestor) = outermost[group.id.as_str()] else {
+                continue;
+            };
+            if group.id != ancestor {
+                hidden.insert(&group.id);
+                collapsed_into.insert(&group.id, ancestor);
+            }
+            for child in &group.members {
+                if child == ancestor {
+                    continue;
+                }
+                hidden.insert(child);
+                collapsed_into.insert(child, ancestor);
+            }
+        }
+    }
+    let mut parent_of = HashMap::<&str, &str>::new();
+    for group in groups.iter().rev() {
+        if hidden.contains(group.id.as_str()) {
+            continue;
+        }
+        for id in &group.members {
+            parent_of.insert(id, &group.id);
+        }
+    }
+    let mut nodes = Vec::new();
+    let mut by_id = HashMap::<&str, usize>::new();
+    for group in groups.iter().rev() {
+        if hidden.contains(group.id.as_str()) {
+            continue;
+        }
+        let names: Vec<&str> = group.classes.iter().map(String::as_str).collect();
+        by_id.insert(&group.id, nodes.len());
+        nodes.push(GraphNode {
+            id: &group.id,
+            label: &group.title,
+            shape: if group.collapsed {
+                Shape::Extended("collapsedGroup")
+            } else {
+                Shape::Rect
+            },
+            is_group: !group.collapsed,
+            parent: parent_of.get(group.id.as_str()).copied(),
+            styles: &[],
+            compiled: compiled(model, &names),
+            classes: group.classes.join(" "),
+            dir: group.direction,
+            vertex: None,
+        });
+    }
+    for vertex in &model.nodes {
+        if hidden.contains(vertex.id.as_str()) {
+            continue;
+        }
+        let names: Vec<&str> = vertex.classes.iter().map(String::as_str).collect();
+        if let Some(&existing) = by_id.get(vertex.id.as_str()) {
+            let node = &mut nodes[existing];
+            node.styles = &vertex.styles;
+            node.compiled = compiled(model, &names);
+            node.classes = vertex.classes.join(" ");
+            continue;
+        }
+        let mut all = vec!["default", "node"];
+        all.extend(&names);
+        nodes.push(GraphNode {
+            id: &vertex.id,
+            label: &vertex.label,
+            shape: vertex.shape,
+            is_group: false,
+            parent: parent_of.get(vertex.id.as_str()).copied(),
+            styles: &vertex.styles,
+            compiled: compiled(model, &all),
+            classes: vertex.classes.join(" "),
+            dir: None,
+            vertex: Some(vertex),
+        });
+    }
+    let mut edges = Vec::new();
+    for raw in &model.edges {
+        let head = |id: &'a str| collapsed_into.get(id).copied().unwrap_or(id);
+        let start = head(&model.nodes[raw.tail].id);
+        let end = head(&model.nodes[raw.head].id);
+        if start == end
+            && (collapsed_into.contains_key(model.nodes[raw.tail].id.as_str())
+                || collapsed_into.contains_key(model.nodes[raw.head].id.as_str()))
+        {
+            continue;
+        }
+        let names: Vec<&str> = raw.classes.iter().map(String::as_str).collect();
+        let classes = compiled(model, &names);
+        let mut own = model.default_edge_style.clone();
+        own.extend(raw.styles.iter().cloned());
+        let style = (!own.is_empty() || !classes.is_empty()).then(|| {
+            let mut all = classes;
+            all.extend(own);
+            resolve_style(&all)
+        });
+        edges.push(GraphEdge {
+            edge: raw,
+            start,
+            end,
+            style,
+            curve: raw
+                .curve
+                .as_deref()
+                .filter(|curve| !curve.is_empty())
+                .or(model.default_curve.as_deref())
+                .or(default_curve),
+        });
+    }
+    Graph { nodes, edges }
 }
 
 pub fn render(source: &str, options: &RenderOptions) -> Result<RenderResult, PeleError> {
-    let mut model = parse(source, options.max_edges)?;
-    let across = fitted(&model, options)?;
-    if model.direction.sideways()
-        && options.auto_direction
-        && options.max_width.is_some_and(|width| {
-            width > 0.0 && width < options.direction_breakpoint && across.width > width
-        })
-    {
-        model.direction = Direction::Tb;
-        let down = fitted(&model, options)?;
-        if down.width < across.width {
-            return Ok(down);
-        }
+    let model = parse(source, options.max_edges)?;
+    let fitted = |down: bool| tighten(options, |tight| draw(&model, options, down, tight));
+    if runs_across(model.direction.as_str()) {
+        turn_to_fit(options, fitted)
+    } else {
+        fitted(false)
     }
-    Ok(across)
 }
 
-fn fitted(model: &Model, options: &RenderOptions) -> Result<RenderResult, PeleError> {
-    let loose = draw(model, options, false)?;
-    if options
-        .max_width
-        .is_some_and(|width| width > 0.0 && loose.width > width)
-    {
-        let tight = draw(model, options, true)?;
-        if tight.width < loose.width {
-            return Ok(tight);
-        }
-    }
-    Ok(loose)
+struct View {
+    style: ResolvedStyle,
+    label: text::Label,
+    shape: Shape,
+    w: f64,
+    h: f64,
+    dy: f64,
 }
 
-fn draw(model: &Model, options: &RenderOptions, tight: bool) -> Result<RenderResult, PeleError> {
+fn flows_sideways(cnodes: &[CNode], i: usize, root: Dir) -> bool {
+    let mut dir = None;
+    let mut p = cnodes[i].parent;
+    let mut hops = 0;
+    while let Some(q) = p {
+        if dir.is_some() || hops >= 10_000 {
+            break;
+        }
+        dir = cnodes[q].dir;
+        p = cnodes[q].parent;
+        hops += 1;
+    }
+    dir.unwrap_or(root).sideways()
+}
+
+fn draw(
+    model: &Model,
+    options: &RenderOptions,
+    turned: bool,
+    tight: bool,
+) -> Result<RenderResult, PeleError> {
     let n = svg::num;
-    let draw_label = |label: &text::Label, x: f64, y: f64, attrs: &str| {
-        svg::label_with_options(label, x, y, attrs, options)
-    };
-    let count = model.nodes.len();
-    let sideways = model.direction.sideways();
-    let measurer = options
-        .measurer
-        .as_deref()
-        .unwrap_or(&text::MetricsMeasurer);
-    let flow_config = &options.config["flowchart"];
+    let theme = &options.theme;
+    let group_pad = if tight { 12.0 } else { GROUP_PAD };
+    let flow = &options.config["flowchart"];
+    let flow_curve = flow["curve"].as_str();
+    let graph = build_graph(model, flow_curve);
+    let size = options.font_size;
+    let edge_size = (size * 0.875).round();
+    let measurer = options.text_measurer();
     let number_option = |key: &str, fallback: f64| {
-        flow_config[key]
+        flow[key]
             .as_f64()
             .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(fallback)
-            .min(2000.0)
+            .map_or(fallback, |value| value.min(2000.0))
     };
     let wrap_width = number_option("wrappingWidth", 200.0);
-    let make_label = |raw: &str, size: f64, max_width: Option<f64>| {
-        text::label_with_measurer(raw, size, max_width, measurer)
-    };
-    let node_styles: Vec<_> = model
+    let pad = options.padding;
+
+    let index: HashMap<&str, usize> = graph
         .nodes
-        .iter()
-        .map(|node| {
-            let mut names = vec!["default".to_owned(), "node".to_owned()];
-            names.extend_from_slice(&node.classes);
-            compiled_styles(model, &names, &node.styles)
-        })
-        .collect();
-    let labels: Vec<_> = model
-        .nodes
-        .iter()
-        .zip(&node_styles)
-        .map(|(node, styles)| {
-            let size = style_property(styles, "font-size")
-                .and_then(|value| value.trim_end_matches("px").parse::<f64>().ok())
-                .filter(|size| *size > 0.0 && *size <= 200.0)
-                .unwrap_or(options.font_size);
-            if !node.shape.has_label() {
-                return text::Label::default();
-            }
-            let markdown = node.label.starts_with('\u{60}')
-                && node.label.ends_with('\u{60}')
-                && node.label.len() >= 2;
-            let raw = if markdown {
-                &node.label[1..node.label.len() - 1]
-            } else {
-                &node.label
-            };
-            let mut base = 0;
-            if style_property(styles, "font-weight").is_some_and(|weight| {
-                weight == "bold"
-                    || weight == "bolder"
-                    || weight.parse::<u16>().is_ok_and(|weight| weight >= 600)
-            }) {
-                base |= text::BOLD;
-            }
-            if style_property(styles, "font-style") == Some("italic") {
-                base |= text::ITALIC;
-            }
-            text::layout_label(raw, markdown, measurer, size, wrap_width, base)
-        })
-        .collect();
-    let dimensions: Vec<_> = model
-        .nodes
-        .iter()
-        .zip(&labels)
-        .map(|(node, label)| node.shape.size(label.width, label.height))
-        .collect();
-    let edge_labels: Vec<_> = model
-        .edges
-        .iter()
-        .map(|edge| {
-            make_label(
-                &edge.label,
-                (options.font_size * 0.875).round(),
-                Some(wrap_width),
-            )
-        })
-        .collect();
-    let cluster_room = if model.groups.is_empty() { 0.0 } else { 48.0 };
-    let mut nodes: Vec<_> = dimensions
         .iter()
         .enumerate()
-        .map(|(index, (w, h, _))| {
-            let mut node = layout::lnode(
-                if sideways { *h } else { *w },
-                if sideways { *w } else { *h },
-            );
-            node.span = model.nodes[index].shape.span(*w, *h, sideways);
-            node
-        })
+        .map(|(i, node)| (node.id, i))
         .collect();
-    let mut edges: Vec<_> = model
-        .edges
-        .iter()
-        .zip(&edge_labels)
-        .map(|(edge, label)| {
-            let width = if label.width > 0.0 {
+    let mut views = Vec::with_capacity(graph.nodes.len());
+    let mut cnodes = Vec::with_capacity(graph.nodes.len());
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let style = if node.styles.is_empty() {
+            resolve_style(&node.compiled)
+        } else {
+            let mut all = node.compiled.clone();
+            all.extend(node.styles.iter().cloned());
+            resolve_style(&all)
+        };
+        let text_style =
+            if style.bold { text::BOLD } else { 0 } | if style.italic { text::ITALIC } else { 0 };
+        let (markdown, raw) = markdown_label(node.label);
+        let font_size = style.font_size.unwrap_or(size);
+        let (view, mut c) = if node.is_group {
+            let label = text::layout_label(raw, markdown, measurer, font_size, 4000.0, text_style);
+            let mut c = cnode(0.0, 0.0, None);
+            c.is_group = true;
+            c.dir = node.dir;
+            c.pad_x = group_pad;
+            c.pad_top = if label.height > 0.0 {
+                label.height + 16.0
+            } else {
+                GROUP_PAD
+            };
+            c.pad_bottom = group_pad;
+            c.min_w = label.width + 2.0 * group_pad - 12.0;
+            (
+                View {
+                    style,
+                    label,
+                    shape: Shape::Rect,
+                    w: 0.0,
+                    h: 0.0,
+                    dy: 0.0,
+                },
+                c,
+            )
+        } else {
+            let shape = node.shape;
+            let label = if shape.has_label() {
+                text::layout_label(raw, markdown, measurer, font_size, wrap_width, text_style)
+            } else {
+                text::Label::default()
+            };
+            let (w, h, dy) = shape.size(label.width, label.height);
+            (
+                View {
+                    style,
+                    label,
+                    shape,
+                    w,
+                    h,
+                    dy,
+                },
+                cnode(w, h, None),
+            )
+        };
+        c.seq = i;
+        views.push(view);
+        cnodes.push(c);
+    }
+    for (c, node) in cnodes.iter_mut().zip(&graph.nodes) {
+        c.parent = node.parent.and_then(|parent| index.get(parent).copied());
+    }
+    inherit_crossed_directions(
+        &mut cnodes,
+        graph
+            .edges
+            .iter()
+            .filter_map(|edge| Some((*index.get(edge.start)?, *index.get(edge.end)?))),
+    );
+    let root_dir = if turned { Dir::Tb } else { model.direction };
+    for (i, view) in views.iter().enumerate() {
+        cnodes[i].span = if graph.nodes[i].is_group {
+            f64::INFINITY
+        } else {
+            view.shape
+                .span(view.w, view.h, flows_sideways(&cnodes, i, root_dir))
+        };
+    }
+
+    let mut cedges = Vec::new();
+    let mut edge_labels = Vec::new();
+    let mut drawn = Vec::new();
+    for edge in &graph.edges {
+        let (Some(&src), Some(&dst)) = (index.get(edge.start), index.get(edge.end)) else {
+            continue;
+        };
+        let label =
+            text::label_with_measurer(&edge.edge.label, edge_size, Some(wrap_width), measurer);
+        if src == dst {
+            if flows_sideways(&cnodes, src, root_dir) {
+                cnodes[src].h += 2.0
+                    * (LOOP
+                        + if label.height > 0.0 {
+                            label.height + 8.0
+                        } else {
+                            0.0
+                        });
+            } else {
+                cnodes[src].w += 2.0
+                    * (LOOP
+                        + if label.width > 0.0 {
+                            label.width + 12.0
+                        } else {
+                            0.0
+                        });
+            }
+        }
+        cedges.push(CEdge {
+            src,
+            dst,
+            minlen: edge.edge.minlen,
+            label_w: if label.width > 0.0 {
                 label.width + 12.0
             } else {
                 0.0
-            };
-            let height = if label.height > 0.0 {
+            },
+            label_h: if label.height > 0.0 {
                 label.height + 4.0
             } else {
                 0.0
-            };
-            layout::ledge_with(
-                edge.tail,
-                edge.head,
-                edge.minlen,
-                if sideways { height } else { width },
-                if sideways { width } else { height },
-            )
-        })
-        .collect();
-    let groups = if model.groups.is_empty() {
-        None
-    } else {
-        Some(Groups {
-            of: model
-                .nodes
-                .iter()
-                .map(|node| node.parent.map_or(-1, |index| index as i32))
-                .collect(),
-            parent: model
-                .groups
-                .iter()
-                .map(|group| group.parent.map_or(-1, |index| index as i32))
-                .collect(),
-        })
+            },
+            route: Vec::new(),
+            label_x: 0.0,
+            label_y: 0.0,
+        });
+        drawn.push(edge);
+        edge_labels.push(label);
+    }
+
+    let layout_options = LayeredOptions {
+        node_sep: number_option("nodeSpacing", NODE_SEP) * if tight { 0.5 } else { 1.0 },
+        edge_sep: EDGE_SEP,
+        rank_sep: number_option("rankSpacing", RANK_SEP) * if tight { 0.75 } else { 1.0 },
+        port_sep: 20.0,
+        tracks: flow_curve.is_some_and(|curve| curve.starts_with("step")),
+        straight: flow_curve == Some("linear"),
+        head_room: marker_trim("arrow_point"),
+        ..LayeredOptions::default()
     };
-    let result = layout::layered(
-        &mut nodes,
-        &mut edges,
-        &LayeredOptions {
-            node_sep: number_option("nodeSpacing", 40.0) * if tight { 0.5 } else { 1.0 }
-                + cluster_room,
-            edge_sep: 16.0,
-            rank_sep: number_option("rankSpacing", 48.0) * if tight { 0.75 } else { 1.0 }
-                + cluster_room,
-            port_sep: 16.0,
-            groups,
-            ..LayeredOptions::default()
-        },
+    let layout = compound_layout(&mut cnodes, &mut cedges, root_dir, &layout_options);
+
+    let title = title_label(
+        options.title.as_deref(),
+        options,
+        size,
+        if tight { title_room(options) } else { 4000.0 },
     );
-    let extra_pad = options.padding
-        + if model.groups.is_empty() {
-            0.0
-        } else {
-            28.0 * model.groups.len().min(16) as f64
-        };
-    let (mut width, mut height) = if sideways {
-        (result.height, result.width)
+    let title_height = if title.height > 0.0 {
+        title.height + 12.0
     } else {
-        (result.width, result.height)
+        0.0
     };
-    let transform = |x: f64, y: f64| -> (f64, f64) {
-        let (x, y) = match model.direction {
-            Direction::Tb => (x, y),
-            Direction::Bt => (x, result.height - y),
-            Direction::Lr => (y, x),
-            Direction::Rl => (result.height - y, x),
-        };
-        (x + extra_pad, y + extra_pad)
-    };
-    width += 2.0 * extra_pad;
-    height += 2.0 * extra_pad;
-    width = width.max(2.0 * options.padding + 1.0);
-    height = height.max(2.0 * options.padding + 1.0);
-    let positions: Vec<_> = nodes
-        .iter()
-        .take(count)
-        .map(|node| transform(node.x, node.y))
-        .collect();
-    let mut contents = String::new();
+    let inner = layout.width.max(title.width);
+    shift_layout(
+        &mut cnodes,
+        &mut cedges,
+        pad + (inner - layout.width) / 2.0,
+        pad + title_height,
+    );
+    let width = (inner + 2.0 * pad).ceil();
+    let height = (layout.height + title_height + 2.0 * pad).ceil();
     let mut links = Vec::new();
-    let mut group_boxes = vec![None::<(f64, f64, f64, f64)>; model.groups.len()];
-    for (i, node) in model.nodes.iter().enumerate() {
-        if let Some(parent) = node.parent {
-            let (x, y) = positions[i];
-            let (w, h, _) = dimensions[i];
-            let value = (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0);
-            group_boxes[parent] = Some(if let Some(old) = group_boxes[parent] {
-                (
-                    old.0.min(value.0),
-                    old.1.min(value.1),
-                    old.2.max(value.2),
-                    old.3.max(value.3),
-                )
-            } else {
-                value
-            });
+
+    let mut crossings = Crossings::new();
+    if cnodes.iter().any(|c| c.is_group) {
+        for e in &cedges {
+            mark_crossings(&mut crossings, &e.route);
         }
     }
-    for i in (0..model.groups.len()).rev() {
-        let label = make_label(&model.groups[i].title, options.font_size, Some(4000.0));
-        if let Some(old) = group_boxes[i] {
-            let top = old.1 - label.height - 16.0;
-            let center = (old.0 + old.2) / 2.0;
-            let w = (old.2 - old.0 + 40.0).max(label.width + 28.0);
-            let value = (center - w / 2.0, top, center + w / 2.0, old.3 + 20.0);
-            group_boxes[i] = Some(value);
-            if let Some(parent) = model.groups[i].parent {
-                group_boxes[parent] = Some(if let Some(old) = group_boxes[parent] {
-                    (
-                        old.0.min(value.0),
-                        old.1.min(value.1),
-                        old.2.max(value.2),
-                        old.3.max(value.3),
-                    )
+
+    let surface = svg::esc(&theme.surface);
+    let border = svg::esc(&theme.border);
+    let line = svg::esc(&theme.line);
+    let shape_attrs = format!(" fill=\"{surface}\" stroke=\"{border}\"");
+    let line_attrs = format!(" stroke=\"{border}\"");
+    let mut clusters = String::new();
+    let mut struck_titles = String::new();
+    let mut nodes_out = String::new();
+    let mut fills = Vec::new();
+    for (i, view) in views.iter().enumerate() {
+        let c = &cnodes[i];
+        let node = &graph.nodes[i];
+        let (x, y) = (c.x, c.y);
+        let classes = class_names(&node.classes);
+        let id = svg::esc_text(node.id);
+        if c.is_group {
+            if paints(&view.style.shape) {
+                fills.push(Fill {
+                    bounds: [x - c.w / 2.0, y - c.h / 2.0, x + c.w / 2.0, y + c.h / 2.0],
+                    shape: view.style.shape.clone(),
+                });
+            }
+            let title_x = cluster_title_x(c, view.label.width, &crossings, group_pad);
+            let title_y = y - c.h / 2.0 + 8.0 + view.label.height / 2.0;
+            let struck = title_crossed(c, view.label.width, title_x, &crossings);
+            let muted = svg::esc(&theme.muted);
+            let title_attrs = format!(
+                " class=\"pele-cluster-label\"{}{}",
+                if struck {
+                    format!(" fill=\"{muted}\"")
                 } else {
-                    value
+                    ink_fill(&view.style, Some(&theme.muted))
+                },
+                view.style.text
+            );
+            if struck {
+                struck_titles.push_str(&struck_title(
+                    &view.label,
+                    title_x,
+                    title_y,
+                    &title_attrs,
+                    &id,
+                    &cnodes,
+                    i,
+                    options,
+                ));
+            }
+            clusters.push_str(&format!(
+                "<g class=\"pele-cluster{classes}\" data-id=\"{id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{}\"{} stroke=\"{border}\"{}/>{}</g>",
+                n(x - c.w / 2.0),
+                n(y - c.h / 2.0),
+                n(c.w),
+                n(c.h),
+                svg::esc(&theme.surface_alt),
+                if sets_fill(&view.style.shape) {
+                    ""
+                } else {
+                    " fill-opacity=\"0.5\""
+                },
+                rounded(&view.style.shape, theme.radius),
+                if struck {
+                    String::new()
+                } else {
+                    svg::label_with_options(&view.label, title_x, title_y, &title_attrs, options)
+                }
+            ));
+            continue;
+        }
+        let shape_style = format!("{shape_attrs}{}", view.style.shape);
+        let line_style = format!("{line_attrs}{}", view.style.line);
+        let inner = shape_svg(
+            view.shape,
+            view.w,
+            view.h,
+            &shape_style,
+            &line_style,
+            theme.radius,
+            &theme.line,
+        );
+        let ink = if view.shape.filled() {
+            ink_fill(&view.style, None)
+        } else {
+            String::new()
+        };
+        let text = svg::label_with_options(
+            &view.label,
+            0.0,
+            view.dy,
+            &format!(" class=\"pele-label\"{ink}{}", view.style.text),
+            options,
+        );
+        let mut body = format!("{inner}{text}");
+        if let Some(vertex) = node.vertex {
+            if let Some(tooltip) = &vertex.tooltip {
+                body = format!("<title>{}</title>{body}", svg::esc_text(tooltip));
+            }
+            if let Some(href) = &vertex.link {
+                let target = vertex.target.as_ref().map_or(String::new(), |value| {
+                    format!(" target=\"{}\"", svg::esc(value))
+                });
+                body = format!(
+                    "<a href=\"{}\"{target} rel=\"noopener\">{body}</a>",
+                    svg::esc(href)
+                );
+                links.push(crate::LinkInfo {
+                    id: vertex.id.clone(),
+                    href: href.clone(),
+                    internal: false,
                 });
             }
         }
-    }
-    for (i, group) in model.groups.iter().enumerate() {
-        let Some((left, top, right, bottom)) = group_boxes[i] else {
-            continue;
-        };
-        let styles = compiled_styles(model, &group.classes, &group.styles);
-        let label = make_label(&group.title, options.font_size, Some(4000.0));
-        let fill = if group.parent.is_none() {
-            &options.theme.surface_alt
-        } else {
-            &options.theme.surface
-        };
-        contents.push_str(&format!("<g class=\"pele-cluster\" data-id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\" fill=\"{}\" stroke=\"{}\"{}/>{}</g>",svg::esc(&group.id),n(left),n(top),n(right-left),n(bottom-top),n(options.theme.radius),svg::esc(fill),svg::esc(&options.theme.border),style_attrs(&styles,false),draw_label(&label,(left+right)/2.0,top+label.height/2.0+4.0,&format!(" class=\"pele-cluster-label\" fill=\"{}\"{}",svg::esc(&options.theme.muted),style_attrs(&styles,true)))));
-    }
-    for (i, edge) in model.edges.iter().enumerate() {
-        if edge.stroke == Stroke::Invisible {
-            continue;
-        }
-        let mut own = model.default_edge_style.clone();
-        own.extend_from_slice(&edge.styles);
-        let styles = compiled_styles(model, &edge.classes, &own);
-        let color = style_property(&styles, "stroke").unwrap_or(&options.theme.line);
-        let mut points: Vec<_> = edges[i]
-            .points
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|point| transform(point[0], point[1]))
-            .collect();
-        if edge.tail == edge.head {
-            let (x, y) = positions[edge.tail];
-            let (w, h, _) = dimensions[edge.tail];
-            points = if sideways {
-                vec![
-                    (x - w / 4.0, y - h / 2.0),
-                    (x - w / 4.0, y - h / 2.0 - 28.0),
-                    (x + w / 4.0, y - h / 2.0 - 28.0),
-                    (x + w / 4.0, y - h / 2.0),
-                ]
-            } else {
-                vec![
-                    (x + w / 2.0, y - h / 4.0),
-                    (x + w / 2.0 + 28.0, y - h / 4.0),
-                    (x + w / 2.0 + 28.0, y + h / 4.0),
-                    (x + w / 2.0, y + h / 4.0),
-                ]
-            };
-        }
-        if points.len() < 2 {
-            let (a, b) = (positions[edge.tail], positions[edge.head]);
-            points = vec![a, b];
-        }
-        for (at, index) in [(0, edge.tail), (points.len() - 1, edge.head)] {
-            let (cx, cy) = positions[index];
-            let (w, h, _) = dimensions[index];
-            let (x, y) = points[at];
-            let (dx, dy) = (x - cx, y - cy);
-            if (dy.abs() - h / 2.0).abs() < 0.5 {
-                let side = if dy < 0.0 { 0 } else { 2 };
-                let amount = model.nodes[index].shape.inset(w, h, side, dx);
-                points[at].1 += if side == 0 { amount } else { -amount };
-            } else if (dx.abs() - w / 2.0).abs() < 0.5 {
-                let side = if dx < 0.0 { 3 } else { 1 };
-                let amount = model.nodes[index].shape.inset(w, h, side, dy);
-                points[at].0 += if side == 3 { amount } else { -amount };
-            }
-        }
-        let path = points
-            .iter()
-            .enumerate()
-            .map(|(index, (x, y))| {
-                format!("{}{},{}", if index == 0 { "M" } else { "L" }, n(*x), n(*y))
-            })
-            .collect::<String>();
-        let dash = if edge.stroke == Stroke::Dotted {
-            " stroke-dasharray=\"4 4\""
-        } else {
-            ""
-        };
-        let thickness = if edge.stroke == Stroke::Thick {
-            "3"
-        } else {
-            "1.5"
-        };
-        contents.push_str(&format!("<g class=\"pele-edge\" data-id=\"{}\"><path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{thickness}\" stroke-linejoin=\"round\"{dash}{}/>",svg::esc(&edge.id),path,svg::esc(color),style_attrs(&styles,false)));
-        let a = points[0];
-        let b = points[1];
-        let z = points[points.len() - 1];
-        let y = points[points.len() - 2];
-        contents.push_str(&marker_svg(
-            edge.start,
-            a.0,
-            a.1,
-            a.0 - b.0,
-            a.1 - b.1,
-            color,
-        ));
-        contents.push_str(&marker_svg(edge.end, z.0, z.1, z.0 - y.0, z.1 - y.1, color));
-        if !edge.label.is_empty() {
-            let (x, y) = if edge.tail == edge.head {
-                points[points.len() / 2]
-            } else {
-                transform(edges[i].label_x, edges[i].label_y)
-            };
-            let label = &edge_labels[i];
-            contents.push_str(&format!(
-                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"2\" fill=\"{}\"/>{}",
-                n(x - label.width / 2.0 - 4.0),
-                n(y - label.height / 2.0 - 2.0),
-                n(label.width + 8.0),
-                n(label.height + 4.0),
-                svg::esc(&options.theme.background),
-                draw_label(
-                    label,
-                    x,
-                    y,
-                    &format!(
-                        " class=\"pele-edge-label\" fill=\"{}\"{}",
-                        svg::esc(&options.theme.foreground),
-                        style_attrs(&styles, true)
-                    )
-                )
-            ));
-        }
-        contents.push_str("</g>");
-    }
-    for (i, node) in model.nodes.iter().enumerate() {
-        let (x, y) = positions[i];
-        let (w, h, dy) = dimensions[i];
-        let styles = &node_styles[i];
-        let attrs = format!(
-            " fill=\"{}\" stroke=\"{}\"{}",
-            svg::esc(&options.theme.surface),
-            svg::esc(&options.theme.border),
-            style_attrs(styles, false)
-        );
-        let line_attrs = format!(
-            " stroke=\"{}\"{}",
-            svg::esc(&options.theme.border),
-            style_attrs(styles, false)
-        );
-        let shape = if let Shape::Extended(name) = node.shape {
-            crate::flow_shapes::draw_with_line_color(
-                name,
-                w,
-                h,
-                &attrs,
-                &line_attrs,
-                options.theme.radius,
-                &options.theme.line,
-            )
-            .expect("canonical extended shape")
-        } else {
-            shape_svg(node.shape, w, h, &attrs, &line_attrs, options.theme.radius)
-        };
-        let label = if !node.shape.has_label() {
-            String::new()
-        } else {
-            draw_label(
-                &labels[i],
-                0.0,
-                dy,
-                &format!(
-                    " class=\"pele-label\" fill=\"{}\"{}",
-                    svg::esc(&options.theme.foreground),
-                    style_attrs(styles, true)
-                ),
-            )
-        };
-        let classes = if node.classes.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", svg::esc(&node.classes.join(" ")))
-        };
-        let tooltip = node.tooltip.as_ref().map_or(String::new(), |value| {
-            format!("<title>{}</title>", svg::esc(value))
-        });
-        let body = format!(
-            "<g class=\"pele-node{classes}\" data-id=\"{}\" transform=\"translate({},{})\">{tooltip}{shape}{label}</g>",
-            svg::esc(&node.id),
+        nodes_out.push_str(&format!(
+            "<g class=\"pele-node pele-shape-{}{classes}\" data-id=\"{id}\" transform=\"translate({},{})\">{body}</g>",
+            view.shape.name(),
             n(x),
             n(y)
+        ));
+    }
+
+    let mut reach = side_reach();
+    for (ce, edge) in cedges.iter().zip(&drawn) {
+        if ce.src == ce.dst || edge.edge.stroke == Stroke::Invisible || ce.route.len() < 6 {
+            continue;
+        }
+        reach.add(
+            ce.src,
+            end_side(&ce.route, 0, &cnodes[ce.src]),
+            edge.edge.start.kind(),
         );
-        if let Some(href) = &node.link {
-            let target = node.target.as_ref().map_or(String::new(), |value| {
-                format!(" target=\"{}\"", svg::esc(value))
-            });
-            contents.push_str(&format!(
-                "<a href=\"{}\"{target} rel=\"noopener\">{body}</a>",
-                svg::esc(href)
-            ));
-            links.push(crate::LinkInfo {
-                id: node.id.clone(),
-                href: href.clone(),
-                internal: false,
-            });
-        } else {
-            contents.push_str(&body);
-        }
+        reach.add(
+            ce.dst,
+            end_side(&ce.route, ce.route.len() - 3, &cnodes[ce.dst]),
+            edge.edge.end.kind(),
+        );
     }
-    let mut bounds = (0.0_f64, 0.0_f64, width, height);
-    for &(left, top, right, bottom) in group_boxes.iter().flatten() {
-        bounds.0 = bounds.0.min(left - options.padding);
-        bounds.1 = bounds.1.min(top - options.padding);
-        bounds.2 = bounds.2.max(right + options.padding);
-        bounds.3 = bounds.3.max(bottom + options.padding);
-    }
-    for edge in &model.edges {
-        if edge.tail == edge.head {
-            let (x, y) = positions[edge.tail];
-            let (w, h, _) = dimensions[edge.tail];
-            bounds.1 = bounds.1.min(y - h / 2.0 - 28.0 - options.padding);
-            bounds.2 = bounds.2.max(x + w / 2.0 + 28.0 + options.padding);
-        }
-    }
-    width = bounds.2 - bounds.0;
-    height = bounds.3 - bounds.1;
-    let title_room = if tight {
-        options
-            .max_width
-            .map(|width| (width - 2.0 * options.padding).max(80.0))
-            .unwrap_or(4000.0)
-    } else {
-        4000.0
-    };
-    let title = options
-        .title
-        .as_ref()
-        .map(|title| make_label(title, options.font_size * 1.1, Some(title_room)));
-    let title_height = title.as_ref().map_or(0.0, |label| label.height + 16.0);
-    if let Some(label) = &title {
-        width = width.max(label.width + 2.0 * options.padding);
-    }
-    contents = format!(
-        "<g transform=\"translate({},{})\">{contents}</g>",
-        n(-bounds.0),
-        n(-bounds.1 + title_height)
-    );
-    if let Some(label) = &title {
-        contents = format!(
-            "{}{}",
-            draw_label(
-                label,
-                width / 2.0,
-                options.padding + label.height / 2.0,
-                &format!(
-                    " class=\"pele-title\" font-weight=\"bold\" fill=\"{}\"",
-                    svg::esc(&options.theme.foreground)
+
+    let mut casings = String::new();
+    let mut edges_out = String::new();
+    let mut labels_out = String::new();
+    let mut loop_seen = HashMap::<usize, usize>::new();
+    for i in 0..cedges.len() {
+        let edge = drawn[i];
+        let style = edge.style.as_ref();
+        let stroke = edge.edge.stroke;
+        if stroke != Stroke::Invisible {
+            let start = edge.edge.start.kind();
+            let end = edge.edge.end.kind();
+            let ce = &cedges[i];
+            let path: EdgePath = if ce.src == ce.dst {
+                let src = ce.src;
+                let k = loop_seen.entry(src).or_insert(0);
+                let at = *k;
+                *k += 1;
+                let view = &views[src];
+                let sideways = flows_sideways(&cnodes, src, root_dir);
+                let c = cnodes[src].clone();
+                loop_path(
+                    &c,
+                    view.w,
+                    view.h,
+                    at,
+                    sideways,
+                    LOOP,
+                    marker_trim(end),
+                    &mut cedges[i],
                 )
-            ),
-            contents
-        );
+            } else {
+                let mut route = ce.route.clone();
+                let last = route.len().saturating_sub(3);
+                let (src, dst) = (&cnodes[ce.src], &cnodes[ce.dst]);
+                let leaves = reach.of(ce.src, end_side(&route, 0, src));
+                let arrives = reach.of(ce.dst, end_side(&route, last, dst));
+                let (from, to) = (&views[ce.src], &views[ce.dst]);
+                inset_route(&mut route, 0, from.w, from.h, src, |side, t| {
+                    from.shape.inset(from.w, from.h, side, t)
+                });
+                inset_route(&mut route, last, to.w, to.h, dst, |side, t| {
+                    to.shape.inset(to.w, to.h, side, t)
+                });
+                route_path(
+                    &route,
+                    edge.curve,
+                    marker_trim(start),
+                    marker_trim(end),
+                    Some(leaves),
+                    Some(arrives),
+                )
+            };
+            let line_style = style.map_or("", |style| style.line.as_str());
+            let over = over_fills(
+                &path.d,
+                &[path.sx, path.sy, path.ex, path.ey],
+                &fills,
+                line_style,
+                path.tokens.as_deref(),
+            );
+            let color = match &over {
+                Some(ink) if !ink.is_empty() => ink.clone(),
+                _ => style
+                    .and_then(|style| style.stroke.as_deref())
+                    .map_or_else(|| line.clone(), svg::esc),
+            };
+            let attrs = match stroke {
+                Stroke::Thick => " stroke-width=\"2.5\"",
+                Stroke::Dotted => " stroke-dasharray=\"3 4\"",
+                _ => "",
+            };
+            if over.as_deref() == Some("") {
+                casings.push_str(&edge_casing(
+                    &path,
+                    start,
+                    end,
+                    line_style,
+                    stroke == Stroke::Thick,
+                    &theme.background,
+                ));
+            }
+            let over_attr = over
+                .as_deref()
+                .filter(|ink| !ink.is_empty())
+                .map_or(String::new(), |ink| format!(" stroke=\"{ink}\""));
+            edges_out.push_str(&format!(
+                "<g class=\"pele-edge\" data-id=\"{}\"{over_attr}{line_style}><path d=\"{}\"{attrs}/>{}{}</g>",
+                svg::esc_text(&edge.edge.id),
+                path.d,
+                marker(start, path.sx, path.sy, path.sdx, path.sdy, &color, "none"),
+                marker(end, path.ex, path.ey, path.edx, path.edy, &color, "none"),
+            ));
+        }
+        let label = &edge_labels[i];
+        if label.width > 0.0 {
+            labels_out.push_str(&edge_label_svg(
+                &edge.edge.id,
+                label,
+                cedges[i].label_x,
+                cedges[i].label_y,
+                style.map_or("", |style| style.text.as_str()),
+                options,
+            ));
+        }
     }
-    height += title_height;
+
+    let mut contents = svg::label_with_options(
+        &title,
+        width / 2.0,
+        pad + title.height / 2.0,
+        " class=\"pele-title\" font-weight=\"bold\"",
+        options,
+    );
+    if !clusters.is_empty() {
+        contents.push_str(&format!("<g class=\"pele-clusters\">{clusters}</g>"));
+    }
+    contents.push_str(&casings_svg(&casings, &theme.background));
+    if !edges_out.is_empty() {
+        contents.push_str(&format!(
+            "<g class=\"pele-edges\" fill=\"none\" stroke=\"{line}\" stroke-linecap=\"round\">{edges_out}</g>"
+        ));
+    }
+    if !struck_titles.is_empty() {
+        contents.push_str(&format!(
+            "<g class=\"pele-cluster-titles\">{struck_titles}</g>"
+        ));
+    }
+    if !labels_out.is_empty() {
+        contents.push_str(&format!(
+            "<g class=\"pele-edge-labels\" font-size=\"{}\">{labels_out}</g>",
+            n(edge_size)
+        ));
+    }
+    contents.push_str(&format!("<g class=\"pele-nodes\">{nodes_out}</g>"));
     let mut effective = options.clone();
     effective.acc_title = model.acc_title.clone().or(effective.acc_title);
     effective.acc_descr = model.acc_descr.clone().or(effective.acc_descr);
-    width = width.ceil();
-    height = height.ceil();
     let svg = svg::document("flowchart", width, height, &effective, &contents);
     let mut result = RenderResult::new("flowchart", svg, width, height);
     result.links = links;
@@ -2055,7 +2265,7 @@ mod tests {
             10,
         )
         .unwrap();
-        assert_eq!(model.direction, Direction::Lr);
+        assert_eq!(model.direction, Dir::Lr);
         assert_eq!(model.nodes.len(), 3);
         assert_eq!(model.nodes[0].shape, Shape::Stadium);
         assert_eq!(model.nodes[1].shape, Shape::Diamond);
@@ -2109,9 +2319,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.groups.len(), 2);
-        assert_eq!(model.groups[1].parent, Some(0));
-        assert_eq!(model.nodes[0].parent, Some(1));
-        assert_eq!(model.nodes[2].parent, Some(0));
+        assert_eq!(model.groups[0].id, "T");
+        assert_eq!(model.groups[0].members, ["A", "B"]);
+        assert_eq!(model.groups[1].id, "S");
+        assert_eq!(model.groups[1].members, ["T", "C"]);
     }
 
     #[test]
@@ -2121,9 +2332,11 @@ mod tests {
             10,
         )
         .unwrap();
-        let styles = compiled_styles(&model, &model.nodes[0].classes, &model.nodes[0].styles);
-        assert_eq!(style_property(&styles, "fill"), Some("#0f0"));
-        assert_eq!(style_property(&styles, "color"), Some("#fff"));
+        let mut styles = compiled(&model, &["default", "node", "hot"]);
+        styles.extend(model.nodes[0].styles.iter().cloned());
+        let style = resolve_style(&styles);
+        assert_eq!(style.shape, " style=\"fill:#0f0;\"");
+        assert_eq!(style.text, " style=\"fill:#fff;\"");
     }
 
     #[test]
@@ -2145,7 +2358,12 @@ mod tests {
             assert!(parse(source, 20).is_err(), "{source}");
         }
         assert!(parse("flowchart LR;A;style A fill:var(--anything)", 20).is_err());
-        assert!(parse("flowchart LR;subgraph S;direction TB;A;end", 20).is_err());
+        let deep = format!(
+            "flowchart LR;{}A;{}",
+            "subgraph S;".repeat(200),
+            "end;".repeat(200)
+        );
+        assert_eq!(parse(&deep, 20).unwrap_err().code, "limit");
     }
 
     #[test]
@@ -2264,9 +2482,9 @@ mod tests {
         assert_eq!(model.nodes.len(), 2);
         assert_eq!(model.edges.len(), 1);
         assert_eq!(model.edges[0].classes, ["animate"]);
-        let styles = compiled_styles(&model, &model.edges[0].classes, &[]);
-        assert_eq!(style_property(&styles, "stroke-dasharray"), Some("9"));
-        assert_eq!(style_property(&styles, "stroke-dashoffset"), Some("900"));
+        let style = resolve_style(&compiled(&model, &["animate"]));
+        assert!(style.line.contains("stroke-dasharray:9;"));
+        assert!(style.line.contains("stroke-dashoffset:900;"));
     }
 
     #[test]

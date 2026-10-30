@@ -225,7 +225,7 @@ fn poly(points: &[f64], attrs: &str) -> String {
 fn rect(w: f64, h: f64, attrs: &str, radius: Option<f64>) -> String {
     let radius = radius.map_or_else(String::new, |radius| format!(" rx=\"{}\"", num(radius)));
     format!(
-        "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{radius}{attrs}/>",
+        "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{attrs}{radius}/>",
         num(-w / 2.0),
         num(-h / 2.0),
         num(w),
@@ -438,7 +438,7 @@ pub fn draw_with_line_color(
             for index in 0..3 {
                 let _ = write!(
                     out,
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\"{attrs}/>",
+                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{attrs} rx=\"{}\"/>",
                     num(-x + f64::from(2 - index) * 4.0),
                     num(-y + f64::from(index) * 4.0),
                     num(w - 8.0),
@@ -750,7 +750,7 @@ pub fn draw_with_line_color(
                 )
         }
         "collapsedGroup" => format!(
-            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\"{attrs}/><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\"{attrs}/>",
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{attrs} rx=\"{}\"/><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"{attrs} rx=\"{}\"/>",
             num(-x + 6.0),
             num(-y + 8.0),
             num(w - 12.0),
