@@ -1,3 +1,9 @@
+pub mod cluster;
+pub mod edges;
+pub mod ink;
+pub mod theme;
+pub mod title;
+
 use std::fmt::Write;
 
 use crate::RenderOptions;

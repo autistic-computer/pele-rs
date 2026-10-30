@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use crate::compound::CNode;
 use crate::svg::{esc, num};
 
 pub const SHAPES: &[&str] = &[
@@ -763,6 +764,42 @@ pub fn draw_with_line_color(
         ),
         _ => unreachable!(),
     })
+}
+
+pub fn end_side(route: &[f64], at: usize, c: &CNode) -> Option<usize> {
+    let dx = route[at] - c.x;
+    let dy = route[at + 1] - c.y;
+    if (dy.abs() - c.h / 2.0).abs() < 0.5 {
+        Some(if dy < 0.0 { 0 } else { 2 })
+    } else if (dx.abs() - c.w / 2.0).abs() < 0.5 {
+        Some(if dx < 0.0 { 3 } else { 1 })
+    } else {
+        None
+    }
+}
+
+pub fn inset_route(
+    route: &mut [f64],
+    at: usize,
+    w: f64,
+    h: f64,
+    c: &CNode,
+    inset: impl Fn(usize, f64) -> f64,
+) {
+    if c.is_group {
+        return;
+    }
+    match end_side(route, at, c) {
+        Some(side @ (0 | 2)) => {
+            let amount = inset(side, route[at] - c.x) + (c.h - h) / 2.0;
+            route[at + 1] += if side == 0 { amount } else { -amount };
+        }
+        Some(side) => {
+            let amount = inset(side, route[at + 1] - c.y) + (c.w - w) / 2.0;
+            route[at] += if side == 3 { amount } else { -amount };
+        }
+        None => {}
+    }
 }
 
 #[cfg(test)]

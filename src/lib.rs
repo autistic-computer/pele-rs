@@ -126,6 +126,10 @@ impl RenderOptions {
             .width(value, size, style)
     }
 
+    pub fn text_measurer(&self) -> &dyn text::TextMeasurer {
+        self.measurer.as_deref().unwrap_or(&text::MetricsMeasurer)
+    }
+
     pub fn label(&self, value: &str, size: f64, max_width: Option<f64>) -> text::Label {
         text::label_with_measurer(
             value,

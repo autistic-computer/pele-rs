@@ -12,7 +12,12 @@ const { build } = await import(pathToFileURL(path.join(source, 'node_modules/esb
 const bundled = await build({
   absWorkingDir: source,
   stdin: {
-    contents: "export * from './src/layout/compound.ts'; export { wrapComponents } from './src/layout/components.ts';",
+    contents: [
+      "export * from './src/layout/compound.ts';",
+      "export { wrapComponents } from './src/layout/components.ts';",
+      "export { routePath, loopPath, marker, markerTrim, overFills, casing } from './src/svg/edges.ts';",
+      "export { markCrossings, clusterTitleX, titleCrossed } from './src/svg/cluster.ts';",
+    ].join(' '),
     resolveDir: source,
     loader: 'ts',
   },
@@ -24,10 +29,14 @@ const bundled = await build({
 const reference = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
 const seed = 987654321;
 let state = seed;
-const next = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0);
+const next = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0) >>> 8;
 const pick = (list) => list[next() % list.length];
 const DIRS = ['TB', 'BT', 'LR', 'RL'];
 const cases = [];
+const paths = [];
+const CURVES = [undefined, 'linear', 'step', 'stepBefore', 'stepAfter', 'natural'];
+const MARKERS = ['arrow_point', 'arrow_circle', 'arrow_cross', 'none'];
+const pathOf = (p) => ({ d: p.d, sx: p.sx, sy: p.sy, sdx: p.sdx, sdy: p.sdy, ex: p.ex, ey: p.ey, edx: p.edx, edy: p.edy });
 for (let k = 0; k < 160; k++) {
   const big = k % 10 === 9;
   const leaves = (big ? 14 : 2) + (next() % (big ? 16 : 10));
@@ -87,6 +96,10 @@ for (let k = 0; k < 160; k++) {
       labelY: 0,
     });
   }
+  if (k % 3 === 0) {
+    const at = next() % n;
+    edges.push({ src: at, dst: at, minlen: 1, labelW: k % 2 ? 0 : 30, labelH: k % 2 ? 0 : 22, route: [], labelX: 0, labelY: 0 });
+  }
   const rootDir = pick(DIRS);
   const inherit = k % 4 === 2;
   const opt = {
@@ -114,8 +127,49 @@ for (let k = 0; k < 160; k++) {
     wrap = { width, gap, result: wrapped ?? null, ...(wrapped ? placed() : {}) };
   }
   cases.push({ ...initial, expected, wrap });
+  if (k % 2 === 0) {
+    const curve = CURVES[k % CURVES.length];
+    const fills = nodes
+      .filter((c) => c.isGroup)
+      .map((c, i) => ({ box: [c.x - c.w / 2, c.y - c.h / 2, c.x + c.w / 2, c.y + c.h / 2], shape: ` style="fill:${i % 2 ? '#202020' : '#f0f0f0'};"` }));
+    const line = k % 8 === 0 ? ' style="stroke:#f00;stroke-width:2px;"' : '';
+    const crossings = new Map();
+    for (const e of edges) reference.markCrossings(crossings, e.route);
+    const titles = nodes.map((c, i) => {
+      if (!c.isGroup) return null;
+      const width = 20 + ((i * 37) % 90);
+      const x = reference.clusterTitleX(c, width, crossings, 20);
+      return { index: i, width, x, crossed: reference.titleCrossed(c, width, x, crossings) };
+    }).filter(Boolean);
+    const drawn = edges.map((e, i) => {
+      const start = MARKERS[(i + k) % 4];
+      const end = MARKERS[(i * 3 + k + 1) % 4];
+      const startTrim = reference.markerTrim(start);
+      const endTrim = reference.markerTrim(end);
+      if (e.src === e.dst) {
+        const copy = { ...e };
+        const c = nodes[e.src];
+        const path = reference.loopPath(c, c.w * 0.8, c.h * 0.8, i % 3, k % 2 === 1, 26, endTrim, copy);
+        return { loop: true, k: i % 3, sideways: k % 2 === 1, end, path: pathOf(path), labelX: copy.labelX, labelY: copy.labelY,
+          over: reference.overFills(path.d, [path.sx, path.sy, path.ex, path.ey], fills, line) ?? null };
+      }
+      if (e.route.length < 6) return null;
+      const reach = i % 3 === 0 ? [startTrim + 9, endTrim + 9] : [undefined, undefined];
+      const path = reference.routePath(e.route, curve, startTrim, endTrim, ...reach);
+      return {
+        route: e.route, start, end, reach: reach[0] === undefined ? null : reach, path: pathOf(path),
+        markers: reference.marker(start, path.sx, path.sy, path.sdx, path.sdy, 'C', 'S') + reference.marker(end, path.ex, path.ey, path.edx, path.edy, 'C'),
+        over: reference.overFills(path.d, [path.sx, path.sy, path.ex, path.ey], fills, line, path.tokens) ?? null,
+        casing: reference.casing(path.d, '', line, i % 5 === 0),
+      };
+    });
+    paths.push({ case: k, curve: curve ?? null, line, fills, titles, edges: drawn });
+  }
 }
 const replacer = (_key, value) => (typeof value === 'number' && !Number.isFinite(value) ? String(value) : value);
 const destination = fileURLToPath(new URL('../tests/fixtures/compound-reference.json', import.meta.url));
 fs.writeFileSync(destination, JSON.stringify({ upstreamRevision: revision, seed, cases }, replacer) + '\n');
 console.log(`Wrote ${cases.length} compound reference cases to ${destination}`);
+const edgeDestination = fileURLToPath(new URL('../tests/fixtures/edge-reference.json', import.meta.url));
+fs.writeFileSync(edgeDestination, JSON.stringify({ upstreamRevision: revision, seed, cases: paths }, replacer) + '\n');
+console.log(`Wrote ${paths.length} edge drawing cases to ${edgeDestination}`);
