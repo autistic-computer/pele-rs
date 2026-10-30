@@ -1587,7 +1587,11 @@ struct Graph<'a> {
     edges: Vec<GraphEdge<'a>>,
 }
 
-fn build_graph<'a>(model: &'a Model, default_curve: Option<&'a str>) -> Graph<'a> {
+fn build_graph<'a>(
+    model: &'a Model,
+    default_curve: Option<&'a str>,
+    inherit_dir: bool,
+) -> Graph<'a> {
     let groups = &model.groups;
     let group_of: HashMap<&str, usize> = groups
         .iter()
@@ -1671,7 +1675,7 @@ fn build_graph<'a>(model: &'a Model, default_curve: Option<&'a str>) -> Graph<'a
             styles: &[],
             compiled: compiled(model, &names),
             classes: group.classes.join(" "),
-            dir: group.direction,
+            dir: group.direction.or(inherit_dir.then_some(model.direction)),
             vertex: None,
         });
     }
@@ -1783,7 +1787,7 @@ fn draw(
     let group_pad = if tight { 12.0 } else { GROUP_PAD };
     let flow = &options.config["flowchart"];
     let flow_curve = flow["curve"].as_str();
-    let graph = build_graph(model, flow_curve);
+    let graph = build_graph(model, flow_curve, flow["inheritDir"] == true);
     let size = options.font_size;
     let edge_size = (size * 0.875).round();
     let measurer = options.text_measurer();
@@ -2485,6 +2489,56 @@ mod tests {
         let style = resolve_style(&compiled(&model, &["animate"]));
         assert!(style.line.contains("stroke-dasharray:9;"));
         assert!(style.line.contains("stroke-dashoffset:900;"));
+    }
+
+    #[test]
+    fn edges_to_subgraphs_and_subgraph_directions_render() {
+        let options = RenderOptions::default();
+        let result = render(
+            "flowchart LR\n subgraph TOP\n direction TB\n subgraph B1\n direction RL\n i1 --> f1\n end\n subgraph B2\n direction BT\n i2 --> f2\n end\n end\n A --> TOP --> B\n B1 --> B2",
+            &options,
+        )
+        .unwrap();
+        for id in ["TOP", "B1", "B2"] {
+            assert!(
+                result
+                    .svg
+                    .contains(&format!("class=\"pele-cluster\" data-id=\"{id}\"")),
+                "{id}"
+            );
+        }
+        assert!(!result.svg.contains("data-id=\"TOP\" transform"));
+        assert!(result.svg.contains("data-id=\"L_A_TOP_0\""));
+        assert!(!result.svg.contains("var(") && !result.svg.contains("NaN"));
+        let model = parse("flowchart LR\n subgraph S\n direction TB\n a\n end", 10).unwrap();
+        assert_eq!(model.groups[0].direction, Some(Dir::Tb));
+    }
+
+    #[test]
+    fn collapsed_subgraphs_draw_one_node_and_redirect_edges() {
+        let result = render(
+            "flowchart TD\n Start --> one\n subgraph one [My Group]\n A --> B\n end\n one --> End\n Start --> A\n one@{ view: collapsed }",
+            &RenderOptions::default(),
+        )
+        .unwrap();
+        assert!(result.svg.contains("pele-shape-collapsedGroup"));
+        assert!(!result.svg.contains("class=\"pele-cluster\""));
+        assert!(!result.svg.contains("data-id=\"A\""));
+        assert_eq!(result.svg.matches("class=\"pele-edge\"").count(), 3);
+    }
+
+    #[test]
+    fn subgraph_membership_follows_the_first_subgraph_to_close() {
+        let model = parse(
+            "flowchart TB\n c1-->a2\n subgraph one\n a1-->a2\n end\n subgraph two\n subgraph inner\n a1\n b1\n end\n b1-->b2\n end",
+            20,
+        )
+        .unwrap();
+        let ids: Vec<_> = model.groups.iter().map(|group| group.id.as_str()).collect();
+        assert_eq!(ids, ["one", "inner", "two"]);
+        assert_eq!(model.groups[0].members, ["a1", "a2"]);
+        assert_eq!(model.groups[1].members, ["b1"]);
+        assert_eq!(model.groups[2].members, ["inner", "b2"]);
     }
 
     #[test]
