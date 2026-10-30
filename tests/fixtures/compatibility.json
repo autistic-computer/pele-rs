@@ -153,8 +153,13 @@
     {
       "id": "zz-state",
       "source": "stateDiagram-v2\n    [*] --> Idle\n    Idle --> Rendering\n    Rendering --> Ready\n    Rendering --> Failed\n    Ready --> [*]",
-      "native_expectation": "unsupported",
-      "labels": [],
+      "native_expectation": "render",
+      "labels": [
+        "Idle",
+        "Rendering",
+        "Ready",
+        "Failed"
+      ],
       "oracle": {
         "ok": true,
         "type": "state",
