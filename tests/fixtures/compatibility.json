@@ -236,8 +236,17 @@
     {
       "id": "zz-gantt",
       "source": "gantt\n    title Project Timeline\n    dateFormat YYYY-MM-DD\n    section Design\n        Wireframes :done, design, 2026-07-01, 3d\n    section Build\n        Core Agent Loop :active, core, 2026-07-05, 5d\n        Tool Integration :tools, after core, 4d\n    section Ship\n        Testing :crit, test, after tools, 3d",
-      "native_expectation": "unsupported",
-      "labels": [],
+      "native_expectation": "render",
+      "labels": [
+        "Project Timeline",
+        "Design",
+        "Build",
+        "Ship",
+        "Wireframes",
+        "Core Agent Loop",
+        "Tool Integration",
+        "Testing"
+      ],
       "oracle": {
         "ok": true,
         "type": "gantt",
