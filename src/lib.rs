@@ -2,6 +2,7 @@ pub mod class;
 pub mod components;
 pub mod compound;
 pub mod er;
+pub mod fit_width;
 pub mod flow_shapes;
 pub mod flowchart;
 pub mod gantt;
