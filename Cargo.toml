@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 description = "Native Rust port of Pele Mermaid rendering with static SVG output"
-repository = "https://github.com/autistic-computer/pele"
+repository = "https://github.com/autistic-computer/pele-rs"
 readme = "README.md"
 publish = false
 
