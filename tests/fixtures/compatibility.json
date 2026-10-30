@@ -167,8 +167,22 @@
     {
       "id": "zz-er",
       "source": "erDiagram\n    USER ||--o{ SESSION : owns\n    SESSION ||--o{ MESSAGE : contains\n    USER {\n        string id PK\n        string email UK\n    }\n    SESSION {\n        string id PK\n        datetime created_at\n    }\n    MESSAGE {\n        string id PK\n        string content\n    }",
-      "native_expectation": "unsupported",
-      "labels": [],
+      "native_expectation": "render",
+      "labels": [
+        "USER",
+        "SESSION",
+        "MESSAGE",
+        "owns",
+        "contains",
+        "string",
+        "id",
+        "PK",
+        "email",
+        "UK",
+        "datetime",
+        "created_at",
+        "content"
+      ],
       "oracle": {
         "ok": true,
         "type": "er",
