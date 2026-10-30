@@ -40,13 +40,29 @@
       "type": "quadrantChart",
       "status": "partial",
       "verification": "See tests/fixtures/compatibility.json and tools/compat.mjs; exact geometry is reported separately from renderability."
+    },
+    {
+      "type": "class",
+      "status": "in-progress",
+      "verification": "Porting; see tools/compat.mjs."
+    },
+    {
+      "type": "state",
+      "status": "in-progress",
+      "verification": "Porting; see tools/compat.mjs."
+    },
+    {
+      "type": "er",
+      "status": "in-progress",
+      "verification": "Porting; see tools/compat.mjs."
+    },
+    {
+      "type": "gantt",
+      "status": "in-progress",
+      "verification": "Porting; see tools/compat.mjs."
     }
   ],
   "not_ported": [
-    "class",
-    "state",
-    "er",
-    "gantt",
     "gitGraph",
     "mindmap",
     "timeline",

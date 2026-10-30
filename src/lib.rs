@@ -1,10 +1,14 @@
+pub mod class;
+pub mod er;
 pub mod flow_shapes;
 pub mod flowchart;
+pub mod gantt;
 pub mod layout;
 pub mod pie;
 mod preprocess;
 pub mod quadrant;
 pub mod sequence;
+pub mod state;
 pub mod svg;
 pub mod text;
 
@@ -14,7 +18,16 @@ use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 pub const UPSTREAM_REVISION: &str = "36e584d59152181927e0d8bf70fddcd2a5f33d6c";
-pub const SUPPORTED_DIAGRAMS: &[&str] = &["flowchart", "sequence", "pie", "quadrantChart"];
+pub const SUPPORTED_DIAGRAMS: &[&str] = &[
+    "flowchart",
+    "sequence",
+    "pie",
+    "quadrantChart",
+    "class",
+    "state",
+    "er",
+    "gantt",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -352,6 +365,10 @@ pub fn render(source: &str, options: &RenderOptions) -> Result<RenderResult, Pel
         "sequence" => sequence::render(&prepared.text, &resolved),
         "pie" => pie::render(&prepared.text, &resolved),
         "quadrantChart" => quadrant::render(&prepared.text, &resolved),
+        "class" => class::render(&prepared.text, &resolved),
+        "state" => state::render(&prepared.text, &resolved),
+        "er" => er::render(&prepared.text, &resolved),
+        "gantt" => gantt::render(&prepared.text, &resolved),
         other => Err(PeleError::unsupported(format!(
             "Diagram type \"{other}\" has not been ported to Rust yet."
         ))),
