@@ -3,10 +3,10 @@
 A native Rust port of [Pele](https://github.com/obsidianmd/pele), rendering Mermaid
 text to static SVG. The render path requires no JavaScript engine, DOM, or browser.
 
-The port currently covers flowcharts, sequence diagrams, pie charts, and quadrant
-charts, with partial syntax coverage. Other diagram families return an explicit
-unsupported error. See [PORT_STATUS.json](PORT_STATUS.json) for the supported
-features, remaining gaps, and recorded compatibility results.
+The port currently covers flowcharts, sequence diagrams, class, state, entity
+relationship and gantt diagrams, pie charts, and quadrant charts. Other diagram
+families return an explicit unsupported error. See [PORT_STATUS.json](PORT_STATUS.json)
+for the supported features, remaining gaps, and recorded compatibility results.
 
 ```rust
 fn main() -> Result<(), pele::PeleError> {
@@ -40,8 +40,9 @@ cargo test --all-features
 
 The ordinary tests use checked-in oracle fixtures and do not require Node or an
 upstream checkout. They cover native rendering and resvg 0.46 rasterization,
-source diagnostics, layout coordinates, chart geometry, extended shapes, text
-measurement, escaping, and limits.
+source diagnostics, layered and compound layout coordinates, edge paths, chart
+geometry, extended shapes, text measurement, escaping, and limits. The class,
+state, ER and gantt suites compare whole SVG bodies with upstream output.
 
 To compare with the original renderer, prepare a checkout of Pele revision
 `36e584d59152181927e0d8bf70fddcd2a5f33d6c` and run its `npm ci` and
