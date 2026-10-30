@@ -1680,7 +1680,7 @@ fn number_badge(
         "middle",
         &options.theme.background,
     );
-    format!("<g class=\"pele-sequence-number\">{shape}{label}</g>")
+    format!("<g class=\"pele-sequence-number\" stroke=\"none\">{shape}{label}</g>")
 }
 
 #[cfg(test)]
@@ -1732,6 +1732,26 @@ mod tests {
         }
         assert!(!rendered.svg.contains("var("));
         assert!(!rendered.svg.contains("foreignObject"));
+    }
+
+    #[test]
+    fn sequence_numbers_do_not_inherit_the_message_stroke() {
+        let source = "sequenceDiagram\nautonumber\nA->>B: one\nB-->>A: two";
+        let rendered = render(source, &RenderOptions::default()).unwrap();
+        let doc = roxmltree::Document::parse(&rendered.svg).unwrap();
+        let digits = doc
+            .descendants()
+            .filter(|node| node.has_tag_name("text"))
+            .filter(|node| matches!(node.text(), Some("1" | "2")))
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len(), 2);
+        for digit in digits {
+            let stroke = digit
+                .ancestors()
+                .find_map(|node| node.attribute("stroke"))
+                .unwrap_or("none");
+            assert_eq!(stroke, "none");
+        }
     }
 
     #[test]
