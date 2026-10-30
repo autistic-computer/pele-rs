@@ -181,8 +181,16 @@
     {
       "id": "zz-class",
       "source": "classDiagram\n    class Agent {\n        +String model\n        +run() Result\n    }\n    class Tool {\n        +String name\n        +execute() Output\n    }\n    Agent --> Tool : invokes",
-      "native_expectation": "unsupported",
-      "labels": [],
+      "native_expectation": "render",
+      "labels": [
+        "Agent",
+        "+String model",
+        "+run() : Result",
+        "Tool",
+        "+String name",
+        "+execute() : Output",
+        "invokes"
+      ],
       "oracle": {
         "ok": true,
         "type": "class",
