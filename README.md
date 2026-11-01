@@ -5,10 +5,10 @@
               ▀▜▀▜▀               <br>
                                   <br>
 ---                               <br>
-name: pele-rs                     <br>
-description: port of pele         <br>
+name: pele-rs                     <br>
+description: port of pele         <br>
 author: autistic.computer         <br>
-license: mit                      <br>
+license: mit                      <br>
 version: 0.1.0                    <br>
 ---                               
 </samp>
