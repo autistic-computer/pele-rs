@@ -10,7 +10,7 @@
 ---<br>
 name: pele-rs<br>
 description: port of pele<br>
-status: alpha<br>
+status: slopware<br>
 license: mit<br>
 version: 0.1.0<br>
 ---
